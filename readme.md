@@ -9,7 +9,7 @@ To overcome these challenges, we developed a custom incremental update framework
 Notebooks offer the most flexibility in managing incremental updates, allowing for precise control over each aspect of the data extraction and refresh process. By utilizing notebook parameters, we created a generalized approach applicable to various data sources.
 
 ## Notebook Parameters
-The notebook receives the following parameters from the pipeline:
+The notebook receives the following parameters from the pipeline, configured as the base parameters in the notebook activity:
 
 - **dataflow_id**: The technical ID of the dataflow, used to refresh and check the status of the dataflow refresh.
 - **workspace_id**: The technical ID of the workspace, required for dataflow refresh operations.
