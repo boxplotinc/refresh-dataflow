@@ -1,4 +1,63 @@
-# Microsoft Fabric Dataflow Incremental Refresh Notebook
+# Incrementally Refresh Dataflow
+
+**Advanced incremental refresh framework for Microsoft Fabric dataflows with intelligent bucketing, automatic retry mechanisms, and CI/CD support.**
+
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Microsoft Fabric](https://img.shields.io/badge/Microsoft-Fabric-orange) ![Dataflow](https://img.shields.io/badge/Dataflow-Gen2-brightgreen)
+
+---
+
+## Table of Contents
+
+- [Why This Tool?](#why-this-tool)
+- [Use Cases](#use-cases)
+- [Key Features](#key-features)
+- [Prerequisites](#prerequisites)
+- [Setup Instructions](#setup-instructions)
+- [Quick Start Example](#quick-start-example)
+- [How It Works](#how-it-works)
+- [Pipeline Parameters](#pipeline-parameters)
+- [Architecture](#architecture)
+- [Integration with Dataflow](#integration-with-dataflow-power-query)
+- [Best Practices](#best-practices)
+- [Troubleshooting](#troubleshooting)
+- [Version History](#version-history)
+
+---
+
+## Why This Tool?
+
+Microsoft Fabric's standard incremental refresh capabilities have limitations that prevent effective data loading in certain scenarios:
+
+**Common Problems:**
+- **Query Folding Issues**: Many data sources don't support query folding, causing full table scans instead of filtered queries
+- **Bucket Size Constraints**: Large historical datasets exceed memory or timeout limits when loaded in single operations
+- **Limited Error Handling**: Transient failures (network issues, temporary service unavailability) cause entire refresh operations to fail
+- **Manual Date Range Management**: No built-in mechanism to automatically track and manage incremental date ranges
+
+**How This Framework Solves These Issues:**
+- ✅ **Custom Bucketing Logic**: Splits large date ranges into configurable buckets to manage memory and timeout constraints
+- ✅ **Intelligent Retry Mechanism**: Automatically retries failed buckets with exponential backoff before marking operations as failed
+- ✅ **Automated Date Range Tracking**: Maintains metadata in warehouse tracking tables to manage incremental loads without manual intervention
+- ✅ **CI/CD & Regular Dataflow Support**: Auto-detects dataflow type and uses appropriate Microsoft Fabric REST API endpoints
+- ✅ **Pipeline Integration**: Proper failure codes ensure seamless integration with Fabric pipeline error handling and alerting
+
+This solution is ideal for data engineers working with Microsoft Fabric who need robust, production-ready incremental refresh capabilities beyond what's available out of the box.
+
+---
+
+## Use Cases
+
+This framework excels in the following scenarios:
+
+- **Historical Data Loading**: Loading years of historical data from APIs or databases with date-range filtering
+- **Non-Folding Data Sources**: Refreshing data from sources that don't support Power Query query folding (REST APIs, custom connectors, certain databases)
+- **Large Dataset Management**: Managing datasets that exceed single-operation memory or timeout limits by processing in smaller buckets
+- **Resilient Data Pipelines**: Building production pipelines that can recover from transient failures without manual intervention
+- **Retroactive Updates**: Handling data sources where historical records can be updated by using configurable overlap windows
+- **Multi-Environment Deployments**: Supporting both development (CI/CD dataflows) and production (regular dataflows) with automatic detection
+- **Automated Scheduling**: Integrating with Fabric pipelines for scheduled, hands-off incremental refresh operations
+
+---
 
 ## Prerequisites
 
