@@ -20,6 +20,8 @@
 - [Integration with Dataflow](#integration-with-dataflow-power-query)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
+- [Data Safety (Backup & Restore)](#7-data-safety-backup--restore)
+- [Ad-hoc Extract Mode](#8-ad-hoc-extract-mode)
 - [Version History](#version-history)
 
 ---
@@ -155,6 +157,8 @@ The notebook orchestrates a coordinated refresh process across multiple Fabric c
 - **Connection Management**: Handles database connections with automatic retry and reconnection logic to prevent timeout issues
 - **Comprehensive Status Tracking**: Maintains detailed metadata about refresh operations in a warehouse tracking table
 - **Pipeline Failure Integration**: Exits with proper failure codes to integrate with Fabric pipeline error handling
+- **Data Safety (Backup & Restore)**: Automatically backs up data before deleting, restores on failure, and recovers from interrupted runs
+- **Ad-hoc Extract Mode**: Load data for an arbitrary date range without disrupting incremental state
 
 ## Pipeline Parameters
 
@@ -166,13 +170,17 @@ Configure the following parameters when setting up the notebook activity in your
 | `dataflow_id` | String | Yes | ID of the dataflow to refresh |
 | `dataflow_name` | String | Yes | Name or description of the dataflow |
 | `initial_load_from_date` | String | Yes* | Start date for initial historical load (format: 'YYYY-MM-DD'). *Required only for first load |
-| `bucket_size_in_days` | Integer | No | Size of each refresh bucket in days (default: 1) |
+| `bucket_size` | Integer or String | No | Size of each refresh bucket. Accepts: integer for days (e.g., `7`), or string with suffix: `"1M"` for months, `"1Y"` for years (default: 1) |
 | `bucket_retry_attempts` | Integer | No | Number of retry attempts for failed buckets (default: 3) |
-| `incrementally_update_last_n_days` | Integer | No | Number of days to overlap/refresh in incremental updates (default: 1) |
+| `incrementally_update_last` | Integer or String | No | Period to overlap/refresh in incremental updates. Accepts: integer for days (e.g., `1`), or string with suffix: `"3M"` for months, `"1Y"` for years (default: 1) |
 | `reinitialize_dataflow` | Boolean | No | Set to True to delete tracking data and restart from scratch (default: False) |
 | `destination_table` | String | Yes | Name of the destination table in the warehouse where data is written. Can be just table name (uses dbo schema) or `schema.table` format for tables in other schemas |
 | `incremental_update_column` | String | Yes | DateTime column used for incremental filtering |
 | `is_cicd_dataflow` | Boolean | No | Explicitly specify if this is a CI/CD dataflow (auto-detected if not provided) |
+| `load_from_date` | String | No | Ad-hoc extract start date (format: 'YYYY-MM-DD'). Both `load_from_date` and `load_to_date` must be set. |
+| `load_to_date` | String | No | Ad-hoc extract end date (format: 'YYYY-MM-DD'). Both `load_from_date` and `load_to_date` must be set. |
+| `backup_schema` | String | No | Schema name for backup tables, created automatically if it doesn't exist (default: `_backup`) |
+| `skip_backup` | Boolean | No | Skip backup/restore before delete operations for faster runs. **Warning:** data is not recoverable if a refresh fails (default: False) |
 
 ## Notebook Constants
 
@@ -242,13 +250,21 @@ Here's a complete example of how to configure the pipeline parameters for your f
   "dataflow_id": "x9y8z7w6-v5u4-3210-zyxw-vu9876543210",
   "dataflow_name": "Sales Data Incremental Refresh",
   "initial_load_from_date": "2024-01-01",
-  "bucket_size_in_days": 7,
+  "bucket_size": 7,
   "bucket_retry_attempts": 3,
-  "incrementally_update_last_n_days": 2,
+  "incrementally_update_last": 2,
   "reinitialize_dataflow": false,
   "destination_table": "FactSales",
   "incremental_update_column": "OrderDate",
   "is_cicd_dataflow": null
+}
+```
+
+**Ad-hoc mode example** -- reload June 2024 data without affecting the incremental tracking state:
+```json
+{
+  "load_from_date": "2024-06-01",
+  "load_to_date": "2024-06-30"
 }
 ```
 
@@ -257,8 +273,8 @@ Here's a complete example of how to configure the pipeline parameters for your f
 - `dataflow_id`: Your dataflow GUID (found in dataflow URL)
 - `dataflow_name`: Descriptive name for logging/tracking
 - `initial_load_from_date`: Start loading data from January 1, 2024 (first run only)
-- `bucket_size_in_days`: Process 7 days at a time
-- `incrementally_update_last_n_days`: Overlap last 2 days on each refresh
+- `bucket_size`: Process 7 days at a time
+- `incrementally_update_last`: Overlap last 2 days on each refresh
 - `destination_table`: Table name in warehouse (uses `dbo` schema by default)
 - `incremental_update_column`: Date column used for filtering
 - `is_cicd_dataflow`: Auto-detect dataflow type (set to `true` or `false` to override)
@@ -289,11 +305,12 @@ The notebook automatically creates and manages an `[Incremental Update]` trackin
 
 - `dataflow_id`, `workspace_id`, `dataflow_name`: Dataflow identifiers
 - `initial_load_from_date`: Historical start date
-- `bucket_size_in_days`, `incrementally_update_last_n_days`: Configuration parameters
+- `bucket_size`, `incrementally_update_last`: Configuration parameters
 - `destination_table`, `incremental_update_column`: Target table information
 - `update_time`, `status`: Current refresh status and timestamp
 - `range_start`, `range_end`: Date range for the current/last refresh bucket
 - `is_cicd_dataflow`: Flag indicating dataflow type (for API routing)
+- `is_adhoc`: Flag indicating this is an ad-hoc extract row (not used for incremental state)
 
 ### 2. Dataflow Type Detection
 
@@ -308,33 +325,35 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
 
 1. Validates that `initial_load_from_date` is provided
 2. Calculates date range from `initial_load_from_date` to yesterday at 23:59:59
-3. Splits the date range into buckets based on `bucket_size_in_days`
+3. Splits the date range into buckets based on `bucket_size`
 4. For each bucket:
+   - Backs up data in the affected range (unless `skip_backup` is True)
    - Deletes any overlapping data in the destination table
    - Updates tracking table with "Running" status
    - Triggers dataflow refresh
    - Waits for completion and monitors status
-   - **If bucket fails**: Retries up to `bucket_retry_attempts` times with exponential backoff (30s, 60s, 120s, etc.)
-   - **If all retries fail**: Logs error, updates tracking table, and **exits with failure code (1)** to fail the pipeline
-   - **If bucket succeeds**: Moves to next bucket
+   - **If bucket fails**: Restores data from backup, then retries up to `bucket_retry_attempts` times with exponential backoff (30s, 60s, 120s, etc.)
+   - **If all retries fail**: Data has been restored from the last backup. Logs error, updates tracking table, and **exits with failure code (1)** to fail the pipeline
+   - **If bucket succeeds**: Drops the backup table, then moves to next bucket
 
 #### **Scenario B: Previous Refresh Failed**
 
 1. Detects failed status from previous run
 2. Retrieves the failed bucket's date range
-3. Retries the failed bucket using the same retry logic as above
-4. **If all retries fail**: Exits with failure code to fail the pipeline
-5. **If retry succeeds**: Continues with normal incremental processing
+3. Backs up data in the affected range (unless `skip_backup` is True)
+4. Retries the failed bucket using the same retry logic as above, restoring from backup on each failure
+5. **If all retries fail**: Data has been restored from backup. Exits with failure code to fail the pipeline
+6. **If retry succeeds**: Drops backup table, continues with normal incremental processing
 
 #### **Scenario C: Incremental Update (Previous Refresh Successful)**
 
 1. Calculates new date range:
-   - If `incrementally_update_last_n_days` is set: Uses `min(last_end_date + 1 second, yesterday - N days)` to ensure overlap without gaps
+   - If `incrementally_update_last` is set: Uses `min(last_end_date + 1 second, yesterday - N days)` to ensure overlap without gaps
    - Otherwise: Starts from `last_end_date + 1 second`
    - End date is always yesterday at 23:59:59
 2. Splits date range into buckets if needed
-3. Processes each bucket with the same retry logic as initial load
-4. **If any bucket fails after all retries**: Exits with failure code to fail the pipeline
+3. Processes each bucket with the same backup/restore, retry, and failure logic as initial load
+4. **If any bucket fails after all retries**: Data has been restored from backup. Exits with failure code to fail the pipeline
 
 ### 4. Retry Mechanism with Exponential Backoff
 
@@ -357,7 +376,7 @@ This ensures transient issues (network glitches, temporary service unavailabilit
 - **End Date**: Always defaults to yesterday at 23:59:59 (never includes today's partial data)
 - **Bucket End Times**: Set to 23:59:59 except for the final bucket
 - **Next Bucket Start**: Previous bucket end + 1 second (ensures no gaps or overlaps)
-- **Overlap Handling**: When `incrementally_update_last_n_days` is set, the start date ensures overlap while avoiding gaps
+- **Overlap Handling**: When `incrementally_update_last` is set, the start date ensures overlap while avoiding gaps
 
 ### 6. Connection Management
 
@@ -366,6 +385,29 @@ The notebook proactively manages database connections to prevent timeout issues:
 - Closes connections before long-running dataflow operations
 - Validates and recreates connections as needed
 - Implements retry logic for all database operations (max 3 retries with 1-second delays)
+
+### 7. Data Safety (Backup & Restore)
+
+Before deleting data from the destination table, the notebook backs up the affected rows into a separate schema:
+
+- **Backup table location**: `[Database].[_backup].[_backup_<dataflow_id>]` (schema configurable via `backup_schema`)
+- **Backup schema**: Auto-created on first run if it doesn't exist
+- **On success**: Backup table is dropped
+- **On failure**: Data is restored from backup, then backup is dropped
+- **On interrupted run**: Next execution detects leftover backup and automatically recovers
+
+Set `skip_backup = True` to disable backups for faster execution. **Warning:** with backups disabled, data deleted before a failed refresh cannot be recovered.
+
+### 8. Ad-hoc Extract Mode
+
+Set both `load_from_date` and `load_to_date` to load data for an arbitrary date range without modifying the incremental tracking state:
+
+- Creates a separate ad-hoc tracking row (with `is_adhoc` flag) so the main incremental row is untouched
+- Splits the ad-hoc range into buckets using the same `bucket_size` setting
+- Uses the same backup/restore, retry, and failure logic as incremental mode
+- On completion, the ad-hoc tracking row is marked as "Completed"
+- On failure, the ad-hoc tracking row is deleted (data already restored from backup)
+- If an ad-hoc run is interrupted, the next execution automatically cleans up the orphaned row
 
 ## Execution Results
 
@@ -420,12 +462,13 @@ in
 
 1. **Bucket Size**: Start with 1 day buckets. Increase if your data volume is low and performance is not a concern.
 2. **Retry Attempts**: Default of 3 is recommended. Increase only if you experience frequent transient failures.
-3. **Overlap Days**: Set `incrementally_update_last_n_days` to 1 or more if your source data can be updated retroactively.
+3. **Overlap Days**: Set `incrementally_update_last` to 1 or more if your source data can be updated retroactively.
 4. **Destination Table Schema**:
    - If your table is in the `dbo` schema: Use just the table name (e.g., `"SalesData"`)
    - If your table is in another schema: Use `schema.table` format (e.g., `"staging.SalesData"` or `"analytics.SalesData"`)
 5. **Monitoring**: Monitor the `[Incremental Update]` table in your warehouse to track refresh history and troubleshoot issues.
 6. **Pipeline Design**: Use the notebook activity failure to trigger alerts or retry logic at the pipeline level.
+7. **Backup Strategy**: Leave `skip_backup` as False (default) for production pipelines. Only use `skip_backup = True` for development/testing or when the source data can be easily reloaded.
 
 ## Troubleshooting
 
@@ -491,7 +534,7 @@ in
    ```
 
 4. **Reduce bucket size:**
-   - Try smaller `bucket_size_in_days` (e.g., 1 day instead of 7)
+   - Try smaller `bucket_size` (e.g., 1 day instead of 7)
    - Large date ranges may timeout or exceed memory limits
 
 5. **Check data source:**
@@ -567,6 +610,23 @@ WHERE dataflow_id = 'your-dataflow-id'
 -- Set reinitialize_dataflow = true in pipeline parameters
 ```
 
+### Backup table recovery
+
+**Problem: Leftover backup table exists**
+
+**Solution:**
+The notebook automatically detects and recovers from leftover backup tables on the next run. If you need to manually intervene:
+```sql
+-- Check for backup tables
+SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('_backup')
+
+-- Manually restore from a backup if needed
+INSERT INTO [dbo].[YourTable] SELECT * FROM [_backup].[_backup_<dataflow_id>]
+
+-- Drop the backup table
+DROP TABLE IF EXISTS [_backup].[_backup_<dataflow_id>]
+```
+
 ### Monitoring and debugging
 
 **Check tracking table history:**
@@ -617,6 +677,7 @@ If you continue experiencing issues:
 
 ## Version History
 
+- **v5.0**: Added data safety with backup/restore before deletes, ad-hoc extract mode, configurable backup schema, and skip-backup option
 - **v3.0**: Added bucket retry mechanism with exponential backoff and pipeline failure integration
 - **v2.0**: Added CI/CD dataflow support with automatic type detection
 - **v1.0**: Initial implementation with basic incremental refresh framework
