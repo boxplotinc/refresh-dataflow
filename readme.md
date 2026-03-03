@@ -104,50 +104,55 @@ The notebook orchestrates a coordinated refresh process across multiple Fabric c
 │              Notebook (DataflowRefresher)               │
 │  ┌────────────────────────────────────────────────────┐ │
 │  │ 1. Read tracking table from Warehouse              │ │
-│  │ 2. Calculate date ranges & buckets                 │ │
-│  │ 3. Update tracking table (Running status)          │ │
-│  │ 4. Call Fabric REST API to trigger dataflow        │ │
-│  │ 5. Poll for completion status                      │ │
-│  │ 6. Update tracking table (Success/Failed status)   │ │
+│  │ 2. Recover from interrupted runs (if needed)       │ │
+│  │ 3. Calculate date ranges & buckets                 │ │
+│  │ 4. Backup data in affected range                   │ │
+│  │ 5. Delete overlapping data from destination table  │ │
+│  │ 6. Update tracking table (Running status)          │ │
+│  │ 7. Call Fabric REST API to trigger dataflow        │ │
+│  │ 8. Poll for completion status                      │ │
+│  │ 9. On success: drop backup, update tracking table  │ │
+│  │    On failure: restore from backup, retry or fail  │ │
 │  └────────────────────────────────────────────────────┘ │
 └─────────┬───────────────────────────────────┬───────────┘
           │                                   │
           ▼                                   ▼
 ┌─────────────────────┐           ┌─────────────────────┐
 │   Warehouse         │           │  Fabric REST API    │
-│  [Incremental       │           │  - Regular DF:      │
-│   Update] Table     │           │    /dataflows/...   │
-│  - range_start      │           │  - CI/CD DF:        │
-│  - range_end        │           │    /items/.../jobs  │
-│  - status           │           └──────────┬──────────┘
-└─────────┬───────────┘                      │
-          │                                  ▼
-          │                        ┌───────────────────┐
-          └───────────────────────>│   Dataflow Gen2   │
-            (Dataflow reads range) │  (Power Query M)  │
-                                   └─────────┬─────────┘
-                                             │
-                                             ▼
-                                   ┌───────────────────┐
-                                   │  Data Source      │
-                                   │  (Filtered by     │
-                                   │   date range)     │
-                                   └─────────┬─────────┘
-                                             │
-                                             ▼
-                                   ┌───────────────────┐
-                                   │   Warehouse       │
-                                   │   Destination     │
-                                   │   Table           │
-                                   └───────────────────┘
+│                     │           │  - Regular DF:      │
+│  [Incremental       │           │    /dataflows/...   │
+│   Update] Table     │           │  - CI/CD DF:        │
+│  - range_start      │           │    /items/.../jobs  │
+│  - range_end        │           └──────────┬──────────┘
+│  - status           │                      │
+│                     │                      ▼
+│  [_backup] Schema   │           ┌───────────────────┐
+│  (temporary backup  │◄─────────>│   Dataflow Gen2   │
+│   during refresh)   │           │  (Power Query M)  │
+└─────────┬───────────┘           └─────────┬─────────┘
+          │                                 │
+          │                                 ▼
+          │                       ┌───────────────────┐
+          └──────────────────────>│  Data Source      │
+            (Dataflow reads range)│  (Filtered by     │
+                                  │   date range)     │
+                                  └─────────┬─────────┘
+                                            │
+                                            ▼
+                                  ┌───────────────────┐
+                                  │   Warehouse       │
+                                  │   Destination     │
+                                  │   Table           │
+                                  └───────────────────┘
 ```
 
 **Key Flow:**
 1. **Pipeline** passes parameters to notebook
-2. **Notebook** manages the tracking table and orchestrates refresh
+2. **Notebook** recovers from any interrupted previous run, then manages the tracking table and orchestrates refresh
 3. **Tracking table** stores date ranges that the dataflow reads
-4. **Dataflow** executes with filtered date range from tracking table
-5. **Data** flows from source to warehouse destination table
+4. **Notebook** backs up affected data before deleting, restores on failure
+5. **Dataflow** executes with filtered date range from tracking table
+6. **Data** flows from source to warehouse destination table
 
 ## Key Features
 
@@ -190,8 +195,8 @@ The following constants must be configured inside the notebook:
 |----------|---------|-------------|
 | `SCHEMA` | `"[Warehouse DB].[dbo]"` | Database schema where the tracking table resides |
 | `INCREMENTAL_TABLE` | `"[Incremental Update]"` | Name of the metadata tracking table |
-| `CONNECTION_ARTIFACT` | `"Warehouse name or id"` | Name of the warehouse artifact |
-| `CONNECTION_ARTIFACT_ID` | `"Workspace name or id"` | Technical ID of the warehouse |
+| `CONNECTION_ARTIFACT` | `"Your Warehouse Name"` | Name of the warehouse artifact |
+| `CONNECTION_ARTIFACT_ID` | `"your-warehouse-id-guid"` | Technical ID (GUID) of the warehouse |
 | `CONNECTION_ARTIFACT_TYPE` | `"Warehouse"` | Type of artifact (typically "Warehouse") |
 
 ## Setup Instructions
@@ -307,7 +312,7 @@ The notebook automatically creates and manages an `[Incremental Update]` trackin
 - `initial_load_from_date`: Historical start date
 - `bucket_size`, `incrementally_update_last`: Configuration parameters
 - `destination_table`, `incremental_update_column`: Target table information
-- `update_time`, `status`: Current refresh status and timestamp
+- `update_time`, `status`: Current refresh status and timestamp. Recognized success statuses: `Success`, `Succeeded`, `Successful`, `Completed`. Failure/terminal statuses: `Failed`, `Cancelled`, `Error`, `Timeout`
 - `range_start`, `range_end`: Date range for the current/last refresh bucket
 - `is_cicd_dataflow`: Flag indicating dataflow type (for API routing)
 - `is_adhoc`: Flag indicating this is an ad-hoc extract row (not used for incremental state)
@@ -316,8 +321,13 @@ The notebook automatically creates and manages an `[Incremental Update]` trackin
 
 The notebook automatically detects whether the dataflow is a CI/CD or regular dataflow by probing the official Microsoft Fabric API endpoints:
 
-- **CI/CD Dataflows**: Uses `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances` endpoint
-- **Regular Dataflows**: Uses `/v1.0/myorg/groups/{workspace_id}/dataflows/{dataflow_id}/refreshes` endpoint
+- **CI/CD Dataflows**:
+  - Detection: `/v1/workspaces/{workspace_id}/items/{dataflow_id}`
+  - Trigger: `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Refresh`
+  - Status: `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances`
+- **Regular Dataflows**:
+  - Trigger: `/v1.0/myorg/groups/{workspace_id}/dataflows/{dataflow_id}/refreshes`
+  - Status: `/v1.0/myorg/groups/{workspace_id}/dataflows/{dataflow_id}/transactions`
 
 ### 3. Processing Logic
 
@@ -343,7 +353,7 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
 3. Backs up data in the affected range (unless `skip_backup` is True)
 4. Retries the failed bucket using the same retry logic as above, restoring from backup on each failure
 5. **If all retries fail**: Data has been restored from backup. Exits with failure code to fail the pipeline
-6. **If retry succeeds**: Drops backup table, continues with normal incremental processing
+6. **If retry succeeds**: Drops backup table, completes the run. The next pipeline run continues with normal incremental processing (Scenario C)
 
 #### **Scenario C: Incremental Update (Previous Refresh Successful)**
 
@@ -357,12 +367,15 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
 
 ### 4. Retry Mechanism with Exponential Backoff
 
-When a bucket refresh fails, the notebook:
+When a bucket refresh fails, the notebook retries with exponential backoff. The `bucket_retry_attempts` parameter controls the **total** number of attempts (including the initial attempt). With the default of 3:
 
-1. **Retry 1**: Waits 30 seconds, then retries
-2. **Retry 2**: Waits 60 seconds, then retries
-3. **Retry 3**: Waits 120 seconds, then retries
-4. **If all retries fail**:
+1. **Attempt 1**: Initial attempt (no wait)
+2. **Attempt 2**: Waits 30 seconds, then retries
+3. **Attempt 3**: Waits 60 seconds, then retries
+
+Each subsequent retry doubles the wait time (30s × 2^(attempt-1)). Setting `bucket_retry_attempts` to 4 would add a fourth attempt after a 120-second wait.
+
+4. **If all attempts fail**:
    - Updates tracking table with failed status
    - Logs detailed error message
    - Raises `RuntimeError` with failure details
@@ -374,7 +387,7 @@ This ensures transient issues (network glitches, temporary service unavailabilit
 ### 5. Date Range Logic
 
 - **End Date**: Always defaults to yesterday at 23:59:59 (never includes today's partial data)
-- **Bucket End Times**: Set to 23:59:59 except for the final bucket
+- **Bucket End Times**: All buckets end at 23:59:59 (the final bucket is capped at yesterday's 23:59:59)
 - **Next Bucket Start**: Previous bucket end + 1 second (ensures no gaps or overlaps)
 - **Overlap Handling**: When `incrementally_update_last` is set, the start date ensures overlap while avoiding gaps
 
@@ -390,7 +403,7 @@ The notebook proactively manages database connections to prevent timeout issues:
 
 Before deleting data from the destination table, the notebook backs up the affected rows into a separate schema:
 
-- **Backup table location**: `[Database].[_backup].[_backup_<dataflow_id>]` (schema configurable via `backup_schema`)
+- **Backup table location**: `[Database].[_backup].[_backup_<dataflow_id_no_hyphens>]` (schema configurable via `backup_schema`; hyphens are stripped from the dataflow ID)
 - **Backup schema**: Auto-created on first run if it doesn't exist
 - **On success**: Backup table is dropped
 - **On failure**: Data is restored from backup, then backup is dropped
@@ -403,6 +416,7 @@ Set `skip_backup = True` to disable backups for faster execution. **Warning:** w
 Set both `load_from_date` and `load_to_date` to load data for an arbitrary date range without modifying the incremental tracking state:
 
 - Creates a separate ad-hoc tracking row (with `is_adhoc` flag) so the main incremental row is untouched
+- Only one ad-hoc row exists per dataflow — subsequent ad-hoc runs reuse the existing row instead of creating duplicates
 - Splits the ad-hoc range into buckets using the same `bucket_size` setting
 - Uses the same backup/restore, retry, and failure logic as incremental mode
 - On completion, the ad-hoc tracking row is marked as "Completed"
@@ -437,7 +451,20 @@ Please check the logs above for detailed error information.
 ================================================================================
 ```
 
-The notebook then exits with code 1, causing the Fabric pipeline to mark the notebook activity as **Failed**.
+For unexpected (non-retry) errors, the output uses a distinct header:
+
+```
+================================================================================
+DATAFLOW REFRESH ERROR
+================================================================================
+Error: [error message]
+
+An unexpected error occurred during the dataflow refresh process.
+Please check the logs above for detailed error information.
+================================================================================
+```
+
+In both cases, the notebook exits with code 1, causing the Fabric pipeline to mark the notebook activity as **Failed**.
 
 ## Integration with Dataflow Power Query
 
@@ -447,7 +474,9 @@ Your dataflow Power Query should read the `range_start` and `range_end` paramete
 let
     Source = Sql.Database("[server]", "[database]"),
     TrackingTable = Source{[Schema="dbo", Item="Incremental Update"]}[Data],
-    FilteredRows = Table.SelectRows(TrackingTable, each [dataflow_id] = "your-dataflow-id"),
+    FilteredRows = Table.SelectRows(TrackingTable, each
+        [dataflow_id] = "your-dataflow-id"
+        and ([is_adhoc] = false or [is_adhoc] = null)),
     RangeStart = FilteredRows{0}[range_start],
     RangeEnd = FilteredRows{0}[range_end],
 
@@ -457,6 +486,8 @@ let
 in
     FilteredData
 ```
+
+> **Note:** The filter on `is_adhoc` ensures the dataflow reads the incremental tracking row, not a temporary ad-hoc row. If you are using ad-hoc extract mode, the ad-hoc row's `is_adhoc` flag is set to `true` so both rows can coexist without conflict.
 
 ## Best Practices
 
@@ -620,11 +651,11 @@ The notebook automatically detects and recovers from leftover backup tables on t
 -- Check for backup tables
 SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('_backup')
 
--- Manually restore from a backup if needed
-INSERT INTO [dbo].[YourTable] SELECT * FROM [_backup].[_backup_<dataflow_id>]
+-- Manually restore from a backup if needed (note: hyphens are stripped from dataflow ID)
+INSERT INTO [dbo].[YourTable] SELECT * FROM [_backup].[_backup_<dataflow_id_no_hyphens>]
 
 -- Drop the backup table
-DROP TABLE IF EXISTS [_backup].[_backup_<dataflow_id>]
+DROP TABLE IF EXISTS [_backup].[_backup_<dataflow_id_no_hyphens>]
 ```
 
 ### Monitoring and debugging
@@ -677,6 +708,7 @@ If you continue experiencing issues:
 
 ## Version History
 
+- **v5.1**: Fixed ad-hoc mode creating duplicate tracking rows — subsequent ad-hoc runs now reuse the existing row instead of inserting a new one. Updated documentation: corrected API endpoints, retry mechanism description, architecture diagram, Power Query example, backup table naming, and other discrepancies
 - **v5.0**: Added data safety with backup/restore before deletes, ad-hoc extract mode, configurable backup schema, and skip-backup option
 - **v3.0**: Added bucket retry mechanism with exponential backoff and pipeline failure integration
 - **v2.0**: Added CI/CD dataflow support with automatic type detection
