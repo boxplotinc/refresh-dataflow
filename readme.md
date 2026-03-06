@@ -110,6 +110,7 @@ The notebook orchestrates a coordinated refresh process across multiple Fabric c
 │  │ 5. Delete overlapping data from destination table  │ │
 │  │ 6. Update tracking table (Running status)          │ │
 │  │ 7. Call Fabric REST API to trigger dataflow        │ │
+│  │    (passes RangeStart/RangeEnd if supported)      │ │
 │  │ 8. Poll for completion status                      │ │
 │  │ 9. On success: drop backup, update tracking table  │ │
 │  │    On failure: restore from backup, retry or fail  │ │
@@ -149,9 +150,9 @@ The notebook orchestrates a coordinated refresh process across multiple Fabric c
 **Key Flow:**
 1. **Pipeline** passes parameters to notebook
 2. **Notebook** recovers from any interrupted previous run, then manages the tracking table and orchestrates refresh
-3. **Tracking table** stores date ranges that the dataflow reads
+3. **Tracking table** stores date ranges (also read by dataflows without parameter support)
 4. **Notebook** backs up affected data before deleting, restores on failure
-5. **Dataflow** executes with filtered date range from tracking table
+5. **Dataflow** executes with filtered date range — passed directly as parameters (CI/CD with public parameters) or read from tracking table (regular dataflows)
 6. **Data** flows from source to warehouse destination table
 
 ## Key Features
@@ -159,6 +160,7 @@ The notebook orchestrates a coordinated refresh process across multiple Fabric c
 - **Intelligent Bucket Processing**: Splits large date ranges into configurable buckets to manage incremental loads efficiently
 - **Automatic Retry Mechanism**: Retries failed bucket refreshes with exponential backoff before failing the entire process
 - **Dataflow Type Auto-Detection**: Automatically detects and supports both regular and CI/CD dataflows
+- **Direct Parameter Passing**: Automatically discovers and passes `RangeStart`/`RangeEnd` as public parameters to CI/CD dataflows that support them, eliminating the need for the dataflow to query the tracking table
 - **Connection Management**: Handles database connections with automatic retry and reconnection logic to prevent timeout issues
 - **Comprehensive Status Tracking**: Maintains detailed metadata about refresh operations in a warehouse tracking table
 - **Pipeline Failure Integration**: Exits with proper failure codes to integrate with Fabric pipeline error handling
@@ -323,7 +325,9 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
 
 - **CI/CD Dataflows**:
   - Detection: `/v1/workspaces/{workspace_id}/items/{dataflow_id}`
-  - Trigger: `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Refresh`
+  - Parameter Discovery: `/v1/workspaces/{workspace_id}/dataflows/{dataflow_id}/parameters`
+  - Trigger (with parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Execute`
+  - Trigger (without parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Refresh`
   - Status: `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances`
 - **Regular Dataflows**:
   - Trigger: `/v1.0/myorg/groups/{workspace_id}/dataflows/{dataflow_id}/refreshes`
@@ -468,7 +472,30 @@ In both cases, the notebook exits with code 1, causing the Fabric pipeline to ma
 
 ## Integration with Dataflow Power Query
 
-Your dataflow Power Query should read the `range_start` and `range_end` parameters from the `[Incremental Update]` table:
+### Option 1: Public Parameters (Recommended for CI/CD Dataflows)
+
+If your dataflow is a CI/CD Dataflow Gen2, you can define `RangeStart` and `RangeEnd` as **public parameters** (type: DateTime). The notebook will automatically discover these parameters and pass the date range values directly when triggering the refresh — no need for the dataflow to query the tracking table.
+
+1. In your dataflow, create two parameters:
+   - **Name**: `RangeStart`, **Type**: DateTime
+   - **Name**: `RangeEnd`, **Type**: DateTime
+2. Use them in your Power Query filter:
+
+```powerquery
+let
+    FilteredData = Table.SelectRows(YourDataSource,
+        each [YourDateColumn] >= RangeStart and [YourDateColumn] <= RangeEnd)
+in
+    FilteredData
+```
+
+The notebook uses the Execute endpoint to pass these values at refresh time. If parameter discovery or the Execute call fails, it falls back to the standard Refresh endpoint automatically.
+
+> **Note:** The tracking table is still updated with `range_start`/`range_end` regardless of whether parameters are passed directly. This maintains backward compatibility, status tracking, and retry logic.
+
+### Option 2: Read from Tracking Table (Regular Dataflows or Fallback)
+
+Your dataflow Power Query reads the `range_start` and `range_end` values from the `[Incremental Update]` table:
 
 ```powerquery
 let
@@ -708,6 +735,7 @@ If you continue experiencing issues:
 
 ## Version History
 
+- **v5.2**: Added automatic discovery and passing of `RangeStart`/`RangeEnd` as public parameters to CI/CD dataflows via the Execute endpoint, with graceful fallback to the Refresh endpoint
 - **v5.1**: Fixed ad-hoc mode creating duplicate tracking rows — subsequent ad-hoc runs now reuse the existing row instead of inserting a new one. Updated documentation: corrected API endpoints, retry mechanism description, architecture diagram, Power Query example, backup table naming, and other discrepancies
 - **v5.0**: Added data safety with backup/restore before deletes, ad-hoc extract mode, configurable backup schema, and skip-backup option
 - **v3.0**: Added bucket retry mechanism with exponential backoff and pipeline failure integration
