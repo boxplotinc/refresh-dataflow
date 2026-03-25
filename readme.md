@@ -188,6 +188,8 @@ Configure the following parameters when setting up the notebook activity in your
 | `backup_schema` | String | No | Schema name for backup tables, created automatically if it doesn't exist (default: `_backup`) |
 | `skip_backup` | Boolean | No | Skip backup/restore before delete operations for faster runs. **Warning:** data is not recoverable if a refresh fails (default: False) |
 | `force_run` | Boolean | No | Override the concurrency guard if a previous run appears active. Use with caution — only set if you are certain the active-looking run is stale (default: False) |
+| `validate_only` | Boolean | No | Resolve IDs and print the execution plan (bucket count, date ranges, parameters) without modifying any data. Useful for verifying configuration before a live run (default: False) |
+| `adhoc_fail_if_unsupported` | Boolean | No | When ad-hoc mode is requested on a dataflow that cannot consume the date range parameters, raise an error instead of silently proceeding with a best-effort reload (default: True) |
 
 ## Notebook Constants
 
@@ -198,7 +200,7 @@ The following constants must be configured inside the notebook:
 | `SCHEMA` | `"[Warehouse DB].[dbo]"` | Database schema where the tracking table resides |
 | `INCREMENTAL_TABLE` | `"[Incremental Update]"` | Name of the metadata tracking table |
 | `CONNECTION_ARTIFACT` | `"Your Warehouse Name"` | Name of the warehouse artifact |
-| `CONNECTION_ARTIFACT_ID` | `"your-warehouse-id-guid"` | Technical ID (GUID) of the warehouse |
+| `CONNECTION_ARTIFACT_ID` | `"your-warehouse-id-guid"` | Technical ID (GUID) of the **warehouse artifact** (not the workspace ID). Find it in the warehouse URL: `.../warehouses/{warehouse_id}`. The default `fabric.get_workspace_id()` is a placeholder only — this must be replaced with the actual warehouse GUID. |
 | `CONNECTION_ARTIFACT_TYPE` | `"Warehouse"` | Type of artifact (typically "Warehouse") |
 
 ## Setup Instructions
@@ -306,7 +308,11 @@ Here's a complete example of how to configure the pipeline parameters for your f
 
 ### 1. Metadata Table Management
 
-The notebook automatically creates and manages an `[Incremental Update]` tracking table in the warehouse with the following schema:
+The notebook automatically creates and manages two warehouse tables.
+
+**`[Incremental Update]`** — current orchestration state (one row per dataflow):
+
+
 
 - `dataflow_id`, `workspace_id`, `dataflow_name`: Dataflow identifiers (resolved by name at runtime)
 - `initial_load_from_date`: Historical start date
@@ -317,7 +323,14 @@ The notebook automatically creates and manages an `[Incremental Update]` trackin
 - `is_cicd_dataflow`: Flag indicating dataflow type (for API routing)
 - `is_adhoc`: Flag indicating this is an ad-hoc extract row (not used for incremental state)
 - `run_id`: UUID of the active notebook execution (used for concurrency detection)
-- `job_instance_id`: CI/CD job instance ID captured from the API Location header (used for direct polling)
+- `job_instance_id`: CI/CD job instance ID captured from the API Location header; persisted immediately after trigger for correlation with Fabric Monitoring Hub
+- `last_backup_table`: Fully-qualified name of the most recent backup table created for this dataflow; used by recovery logic to restore the correct backup without ambiguity
+
+**`[Incremental Update_History]`** — append-only execution ledger (one row per bucket attempt):
+
+Columns: `id` (identity), `dataflow_id`, `dataflow_name`, `run_id`, `job_instance_id`, `trigger_mode` (initial_load / incremental / adhoc / failed_bucket), `bucket_index`, `range_start`, `range_end`, `status`, `attempt_number`, `is_cicd_dataflow`, `is_adhoc`, `start_time`, `end_time`, `created_at`.
+
+This table is append-only and never updated in place. It provides a full audit trail of every bucket attempt for RCA, compliance, and performance analysis without relying on external logs. History write failures are non-fatal and do not block orchestration.
 
 ### 2. Dataflow Type Detection
 
@@ -377,7 +390,7 @@ When a bucket refresh fails, the notebook retries with exponential backoff. The 
 2. **Attempt 2**: Waits 30 seconds, then retries
 3. **Attempt 3**: Waits 60 seconds, then retries
 
-Each subsequent retry doubles the wait time (30s × 2^(attempt-1)). Setting `bucket_retry_attempts` to 4 would add a fourth attempt after a 120-second wait.
+Each subsequent retry doubles the wait time (30s × 2^(attempt-1)) plus a small random jitter (±5–10 s) to reduce thundering-herd pressure when multiple buckets fail simultaneously. Setting `bucket_retry_attempts` to 4 would add a fourth attempt after approximately a 120-second wait.
 
 4. **If all attempts fail**:
    - Updates tracking table with failed status
@@ -428,7 +441,7 @@ Set both `load_from_date` and `load_to_date` to load data for an arbitrary date 
 | Regular dataflow (standard incremental filter) | Dataflow re-runs the last incremental range — **ad-hoc range is ignored** |
 | Regular dataflow with custom ad-hoc query logic | Works if Power Query explicitly reads the `is_adhoc=1` row |
 
-The notebook logs a warning when ad-hoc mode is used on a dataflow that does not support direct parameter passing.
+By default (`adhoc_fail_if_unsupported = True`) the notebook raises an error when ad-hoc mode is used on a dataflow that does not support direct parameter passing, rather than silently running with unintended data. Set `adhoc_fail_if_unsupported = False` to downgrade this to a warning and proceed with a best-effort reload.
 
 - Creates a separate ad-hoc tracking row (with `is_adhoc` flag) so the main incremental row is untouched
 - Only one ad-hoc row exists per dataflow — subsequent ad-hoc runs reuse the existing row instead of creating duplicates
@@ -526,6 +539,22 @@ in
 ```
 
 > **Note:** The filter on `is_adhoc` ensures the dataflow reads the incremental tracking row, not a temporary ad-hoc row. If you are using ad-hoc extract mode, the ad-hoc row's `is_adhoc` flag is set to `true` so both rows can coexist without conflict.
+
+## Platform Constraints and Known Limitations
+
+> **CI/CD Background Jobs API — Public Preview**
+>
+> The Fabric REST endpoints used for CI/CD dataflow triggering and polling (`/v1/workspaces/.../items/.../jobs/instances`) are currently in **Public Preview** and are explicitly **not recommended for production use** by Microsoft. They may change or be removed without notice. Additionally, these APIs **do not support Service Principals or Managed Identities** — they require a user token with at least Member workspace permissions, making them incompatible with standard enterprise service connection accounts (Azure DevOps, GitHub Actions, etc.).
+>
+> Mitigation: The notebook falls back automatically from the Execute endpoint to the standard Refresh endpoint when parameter passing fails. Monitor [Microsoft's changelog](https://learn.microsoft.com/en-us/fabric/data-factory/dataflow-gen2-refresh) for GA availability. Until then, consider this path Tier-2/Tier-3 suitable and not Tier-1 mission-critical.
+
+> **Regular Dataflow Polling — Probabilistic Correlation**
+>
+> The regular (non-CI/CD) dataflow refresh path correlates with the correct transaction by comparing the trigger timestamp within a 60-second skew window. In shared workspaces where another operator could trigger a manual refresh close in time, a false correlation is theoretically possible. Mitigate by running notebook-managed regular dataflows in a dedicated workspace with no manual refreshes.
+
+> **Concurrency — Advisory, Not Atomic**
+>
+> The concurrency guard is a check-then-act pattern, not a database-level lock. Two pipeline runs starting within milliseconds of each other could both pass the guard. The `run_id` suffix on backup tables isolates their data operations, but the risk of redundant processing exists in extreme concurrent scenarios.
 
 ## Best Practices
 
@@ -746,6 +775,20 @@ If you continue experiencing issues:
 
 ## Version History
 
+- **v5.4**: Production hardening release addressing all findings from dual-engineer architecture review (critique.md + critique2.md):
+  - **High fix**: `force_run` is now a notebook parameter wired through to the entrypoint — operators can override stale concurrency guards from the pipeline without manual warehouse edits
+  - **High fix**: SQL identifier validation (`_validate_sql_identifier`) guards `destination_table` and `incremental_update_column` against characters that would break DDL/DML at runtime; `_bq()` helper enforces consistent bracket-quoting
+  - **High fix**: `job_instance_id` is now persisted to the tracking table immediately after every refresh trigger (in all four execution paths), enabling correlation between warehouse state and Fabric Monitoring Hub
+  - **High fix**: Per-column VARCHAR widening — each of the five varchar columns is migrated independently so partial schema drift cannot remain silently unaddressed
+  - **Medium-High fix**: Append-only `[Incremental Update_History]` table added — one row per bucket attempt with `trigger_mode`, `bucket_index`, `attempt_number`, `start_time`, `end_time`, and all correlation IDs; history writes are non-fatal
+  - **Medium-High fix**: `last_backup_table` column added to `[Incremental Update]`; set when backup is created and consumed by recovery logic to restore the exact backup rather than picking by prefix search — ambiguous multi-orphan recovery is now refused rather than guessed
+  - **Medium fix**: `_restore_from_backup` derives its column list from the backup table schema rather than the current destination table, remaining correct across deployment-time schema changes
+  - **Medium fix**: Exponential backoff now includes ±5–10 s random jitter on all four retry sites to reduce thundering-herd pressure under capacity throttle
+  - **Medium fix**: `validate_only` mode added — resolves IDs and prints execution plan without touching data
+  - **Medium fix**: `adhoc_fail_if_unsupported` parameter (default True) — ad-hoc mode now fails closed when the dataflow cannot consume the date range, instead of silently proceeding
+  - **Medium fix**: Fabric refresh limit pre-run estimation — logs estimated refresh count and warns when it may approach the 150/300 per-24h service limit
+  - **Medium fix**: `FabricRestClient` used for Fabric-native `/v1/` endpoints; `PowerBIRestClient` retained for `/v1.0/myorg/` transaction polling
+  - **Docs**: `CONNECTION_ARTIFACT_ID` clarified as warehouse artifact GUID (not workspace ID); `force_run` entry correct in parameters table; CI/CD preview API constraints and Service Principal limitation documented; history ledger described; platform constraints section added
 - **v5.3**: Hardening release addressing all critical and high findings from dual-engineer architecture review:
   - **Critical fix**: Restore logic now pre-deletes the target range before inserting from backup, eliminating silent duplication from partial Fabric dataflow writes
   - **Critical fix**: Backup/restore uses explicit column lists (via `sys.columns`) instead of `SELECT *`, preventing failures under schema evolution
