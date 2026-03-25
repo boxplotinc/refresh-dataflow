@@ -173,9 +173,8 @@ Configure the following parameters when setting up the notebook activity in your
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `workspace_id` | String | Yes | ID of the Fabric workspace containing the dataflow |
-| `dataflow_id` | String | Yes | ID of the dataflow to refresh |
-| `dataflow_name` | String | Yes | Name or description of the dataflow |
+| `workspace_name` | String | No | Name of the Fabric workspace containing the dataflow. Defaults to the current workspace if omitted. The notebook resolves this to a workspace ID automatically. |
+| `dataflow_name` | String | Yes | Name of the dataflow to refresh. The notebook resolves this to a dataflow ID automatically. |
 | `initial_load_from_date` | String | Yes* | Start date for initial historical load (format: 'YYYY-MM-DD'). *Required only for first load |
 | `bucket_size` | Integer or String | No | Size of each refresh bucket. Accepts: integer for days (e.g., `7`), or string with suffix: `"1M"` for months, `"1Y"` for years (default: 1) |
 | `bucket_retry_attempts` | Integer | No | Number of retry attempts for failed buckets (default: 3) |
@@ -188,6 +187,7 @@ Configure the following parameters when setting up the notebook activity in your
 | `load_to_date` | String | No | Ad-hoc extract end date (format: 'YYYY-MM-DD'). Both `load_from_date` and `load_to_date` must be set. |
 | `backup_schema` | String | No | Schema name for backup tables, created automatically if it doesn't exist (default: `_backup`) |
 | `skip_backup` | Boolean | No | Skip backup/restore before delete operations for faster runs. **Warning:** data is not recoverable if a refresh fails (default: False) |
+| `force_run` | Boolean | No | Override the concurrency guard if a previous run appears active. Use with caution — only set if you are certain the active-looking run is stale (default: False) |
 
 ## Notebook Constants
 
@@ -253,8 +253,7 @@ Here's a complete example of how to configure the pipeline parameters for your f
 **Pipeline Parameters:**
 ```json
 {
-  "workspace_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "dataflow_id": "x9y8z7w6-v5u4-3210-zyxw-vu9876543210",
+  "workspace_name": "My Fabric Workspace",
   "dataflow_name": "Sales Data Incremental Refresh",
   "initial_load_from_date": "2024-01-01",
   "bucket_size": 7,
@@ -276,9 +275,8 @@ Here's a complete example of how to configure the pipeline parameters for your f
 ```
 
 **Parameter Explanation:**
-- `workspace_id`: Your Fabric workspace GUID (found in workspace URL)
-- `dataflow_id`: Your dataflow GUID (found in dataflow URL)
-- `dataflow_name`: Descriptive name for logging/tracking
+- `workspace_name`: Name of your Fabric workspace (omit to use the current workspace)
+- `dataflow_name`: Name of the dataflow (the notebook resolves the ID internally)
 - `initial_load_from_date`: Start loading data from January 1, 2024 (first run only)
 - `bucket_size`: Process 7 days at a time
 - `incrementally_update_last`: Overlap last 2 days on each refresh
@@ -310,14 +308,16 @@ Here's a complete example of how to configure the pipeline parameters for your f
 
 The notebook automatically creates and manages an `[Incremental Update]` tracking table in the warehouse with the following schema:
 
-- `dataflow_id`, `workspace_id`, `dataflow_name`: Dataflow identifiers
+- `dataflow_id`, `workspace_id`, `dataflow_name`: Dataflow identifiers (resolved by name at runtime)
 - `initial_load_from_date`: Historical start date
 - `bucket_size`, `incrementally_update_last`: Configuration parameters
 - `destination_table`, `incremental_update_column`: Target table information
-- `update_time`, `status`: Current refresh status and timestamp. Recognized success statuses: `Success`, `Succeeded`, `Successful`, `Completed`. Failure/terminal statuses: `Failed`, `Cancelled`, `Error`, `Timeout`
-- `range_start`, `range_end`: Date range for the current/last refresh bucket
+- `update_time`, `status`: Current refresh status and timestamp (UTC). Recognized success statuses: `Success`, `Succeeded`, `Successful`, `Completed`. Failure/terminal statuses: `Failed`, `Cancelled`, `Error`, `Timeout`
+- `range_start`, `range_end`: Date range for the current/last refresh bucket (UTC)
 - `is_cicd_dataflow`: Flag indicating dataflow type (for API routing)
 - `is_adhoc`: Flag indicating this is an ad-hoc extract row (not used for incremental state)
+- `run_id`: UUID of the active notebook execution (used for concurrency detection)
+- `job_instance_id`: CI/CD job instance ID captured from the API Location header (used for direct polling)
 
 ### 2. Dataflow Type Detection
 
@@ -417,7 +417,18 @@ Set `skip_backup = True` to disable backups for faster execution. **Warning:** w
 
 ### 8. Ad-hoc Extract Mode
 
-Set both `load_from_date` and `load_to_date` to load data for an arbitrary date range without modifying the incremental tracking state:
+Set both `load_from_date` and `load_to_date` to load data for an arbitrary date range without modifying the incremental tracking state.
+
+**Compatibility:**
+
+| Dataflow type | Ad-hoc behaviour |
+|---|---|
+| CI/CD with public `RangeStart`/`RangeEnd` parameters | **Full support** — range is passed directly via the Execute API at refresh time |
+| CI/CD without public parameters | Range is written to the tracking table ad-hoc row; dataflow must read it explicitly |
+| Regular dataflow (standard incremental filter) | Dataflow re-runs the last incremental range — **ad-hoc range is ignored** |
+| Regular dataflow with custom ad-hoc query logic | Works if Power Query explicitly reads the `is_adhoc=1` row |
+
+The notebook logs a warning when ad-hoc mode is used on a dataflow that does not support direct parameter passing.
 
 - Creates a separate ad-hoc tracking row (with `is_adhoc` flag) so the main incremental row is untouched
 - Only one ad-hoc row exists per dataflow — subsequent ad-hoc runs reuse the existing row instead of creating duplicates
@@ -538,7 +549,7 @@ in
 
 **Solutions:**
 1. **Verify all required parameters are provided:**
-   - `workspace_id`, `dataflow_id`, `dataflow_name`
+   - `dataflow_name` (required), `workspace_name` (optional — defaults to current workspace)
    - `destination_table`, `incremental_update_column`
    - `initial_load_from_date` (required for first run only)
 
@@ -735,6 +746,19 @@ If you continue experiencing issues:
 
 ## Version History
 
+- **v5.3**: Hardening release addressing all critical and high findings from dual-engineer architecture review:
+  - **Critical fix**: Restore logic now pre-deletes the target range before inserting from backup, eliminating silent duplication from partial Fabric dataflow writes
+  - **Critical fix**: Backup/restore uses explicit column lists (via `sys.columns`) instead of `SELECT *`, preventing failures under schema evolution
+  - **High fix**: Job-correlated polling — CI/CD refresh captures the `job_instance_id` from the `Location` header and polls that exact instance; regular dataflow polling correlates by trigger timestamp
+  - **High fix**: Regular dataflow API payload corrected to `{"notifyOption": "NoNotification"}` per documented contract
+  - **High fix**: Concurrency guard — detects active runs and refuses to start unless the existing run is stale or `force_run=True`
+  - **High fix**: Backup tables now include a per-run suffix (`_backup_<id>_<run_id_short>`) to isolate concurrent runs
+  - **High fix**: Ad-hoc mode now logs a clear warning when the dataflow cannot receive the range via direct parameters
+  - **Medium fix**: `Retry-After` header from CI/CD 202 responses is honoured as the initial poll delay
+  - **Medium fix**: CI/CD detection upgraded to probe the parameters endpoint (capability check, not type inference)
+  - **Medium fix**: All timestamps use `datetime.utcnow()` (was `datetime.now()`, implicitly UTC in Fabric but now explicit)
+  - **Medium fix**: Tracking table schema — varchar columns widened to 255, `run_id` and `job_instance_id` columns added, `dbo` schema hardcode replaced with dynamic detection
+  - **Medium fix**: README updated to reflect name-based parameter resolution, ad-hoc mode compatibility table, and new `force_run` parameter
 - **v5.2**: Added automatic discovery and passing of `RangeStart`/`RangeEnd` as public parameters to CI/CD dataflows via the Execute endpoint, with graceful fallback to the Refresh endpoint
 - **v5.1**: Fixed ad-hoc mode creating duplicate tracking rows — subsequent ad-hoc runs now reuse the existing row instead of inserting a new one. Updated documentation: corrected API endpoints, retry mechanism description, architecture diagram, Power Query example, backup table naming, and other discrepancies
 - **v5.0**: Added data safety with backup/restore before deletes, ad-hoc extract mode, configurable backup schema, and skip-backup option
