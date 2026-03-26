@@ -177,7 +177,7 @@ Configure the following parameters when setting up the notebook activity in your
 | `dataflow_name` | String | Yes | Name of the dataflow to refresh. The notebook resolves this to a dataflow ID automatically. |
 | `initial_load_from_date` | String | Yes* | Start date for initial historical load (format: 'YYYY-MM-DD'). *Required only for first load |
 | `bucket_size` | Integer or String | No | Size of each refresh bucket. Accepts: integer for days (e.g., `7`), or string with suffix: `"1M"` for months, `"1Y"` for years (default: 1) |
-| `bucket_retry_attempts` | Integer | No | Number of retry attempts for failed buckets (default: 3) |
+| `bucket_retry_attempts` | Integer | No | Total number of attempts per bucket, including the initial attempt (e.g., 3 = 1 initial + 2 retries; default: 3) |
 | `incrementally_update_last` | Integer or String | No | Period to overlap/refresh in incremental updates. Accepts: integer for days (e.g., `1`), or string with suffix: `"3M"` for months, `"1Y"` for years (default: 1) |
 | `reinitialize_dataflow` | Boolean | No | Set to True to delete tracking data and restart from scratch (default: False) |
 | `destination_table` | String | Yes | Name of the destination table in the warehouse where data is written. Can be just table name (uses dbo schema) or `schema.table` format for tables in other schemas |
