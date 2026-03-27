@@ -127,7 +127,7 @@ The notebook orchestrates a coordinated refresh process across multiple Fabric c
 │  - range_end        │           └──────────┬──────────┘
 │  - status           │                      │
 │                     │                      ▼
-│  [_backup] Schema   │           ┌───────────────────┐
+│  [temporary_backup] │           ┌───────────────────┐
 │  (temporary backup  │◄─────────>│   Dataflow Gen2   │
 │   during refresh)   │           │  (Power Query M)  │
 └─────────┬───────────┘           └─────────┬─────────┘
@@ -185,7 +185,7 @@ Configure the following parameters when setting up the notebook activity in your
 | `is_cicd_dataflow` | Boolean | No | Explicitly specify if this is a CI/CD dataflow (auto-detected if not provided) |
 | `load_from_date` | String | No | Ad-hoc extract start date (format: 'YYYY-MM-DD'). Both `load_from_date` and `load_to_date` must be set. |
 | `load_to_date` | String | No | Ad-hoc extract end date (format: 'YYYY-MM-DD'). Both `load_from_date` and `load_to_date` must be set. |
-| `backup_schema` | String | No | Schema name for backup tables, created automatically if it doesn't exist (default: `_backup`) |
+| `backup_schema` | String | No | Schema name for backup tables, created automatically if it doesn't exist (default: `temporary_backup`) |
 | `skip_backup` | Boolean | No | Skip backup/restore before delete operations for faster runs. **Warning:** data is not recoverable if a refresh fails (default: False) |
 | `force_run` | Boolean | No | Override the concurrency guard if a previous run appears active. Use with caution — only set if you are certain the active-looking run is stale (default: False) |
 | `validate_only` | Boolean | No | Resolve IDs and print the execution plan (bucket count, date ranges, parameters) without modifying any data. Useful for verifying configuration before a live run (default: False) |
@@ -245,6 +245,30 @@ Ensure your dataflow Power Query includes logic to read `range_start` and `range
 2. Monitor the notebook execution in Fabric
 3. Check the `[Incremental Update]` table in your warehouse to verify tracking records are created
 4. Verify data appears in your destination table
+
+### Step 6: Bootstrap Tracking Row (Recommended)
+
+Before running the pipeline for the first time, call `bootstrap_tracking_row()` once during initial deployment to pre-seed the singleton tracking row with `status='New'`.
+
+**Why this matters**: Fabric Warehouse constraints are `NOT ENFORCED`. If two pipeline runs start simultaneously on a fresh deployment (no prior tracking row), both will attempt to `INSERT` a new row and succeed — creating duplicate rows that violate the singleton invariant. Pre-seeding with `bootstrap_tracking_row()` ensures the runtime always finds an existing row and uses the atomic `UPDATE` acquire path, which is race-safe (only one writer wins the compare-and-swap).
+
+**How to call it** (run once from a notebook cell or setup script):
+
+```python
+refresher.bootstrap_tracking_row(
+    dataflow_id="<your-dataflow-guid>",
+    workspace_id="<your-workspace-guid>",
+    dataflow_name="Sales Data Incremental Refresh",
+    initial_load_from_date="2024-01-01",
+    bucket_size=7,
+    incrementally_update_last=2,
+    destination_table="FactSales",
+    incremental_update_column="OrderDate",
+    is_cicd_dataflow=False
+)
+```
+
+This method is idempotent — calling it multiple times is safe (it is a no-op if a row already exists).
 
 ## Quick Start Example
 
@@ -326,11 +350,11 @@ The notebook automatically creates and manages two warehouse tables.
 - `job_instance_id`: CI/CD job instance ID captured from the API Location header; persisted immediately after trigger for correlation with Fabric Monitoring Hub
 - `last_backup_table`: Fully-qualified name of the most recent backup table created for this dataflow; used by recovery logic to restore the correct backup without ambiguity
 
-**`[Incremental Update_History]`** — append-only execution ledger (one row per bucket attempt):
+**`[Incremental Update History]`** — execution ledger (one row per bucket attempt):
 
 Columns: `id` (identity), `dataflow_id`, `dataflow_name`, `run_id`, `job_instance_id`, `trigger_mode` (initial_load / incremental / adhoc / failed_bucket), `bucket_index`, `range_start`, `range_end`, `status`, `attempt_number`, `is_cicd_dataflow`, `is_adhoc`, `start_time`, `end_time`, `created_at`.
 
-This table is append-only and never updated in place. It provides a full audit trail of every bucket attempt for RCA, compliance, and performance analysis without relying on external logs. History write failures are non-fatal and do not block orchestration.
+A row is inserted with `status=Running` at bucket start and then finalized in place by `id` at completion. This provides a full audit trail of every bucket attempt for RCA, compliance, and performance analysis without relying on external logs. History write failures are non-fatal and do not block orchestration.
 
 ### 2. Dataflow Type Detection
 
@@ -340,7 +364,7 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
   - Detection: `/v1/workspaces/{workspace_id}/items/{dataflow_id}`
   - Parameter Discovery: `/v1/workspaces/{workspace_id}/dataflows/{dataflow_id}/parameters`
   - Trigger (with parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Execute`
-  - Trigger (without parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Refresh`
+  - Trigger (without parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Refresh` *(note: after destructive work begins, the runtime fails closed — it does not silently fall back to the Refresh endpoint if Execute fails mid-operation)*
   - Status: `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances`
 - **Regular Dataflows**:
   - Trigger: `/v1.0/myorg/groups/{workspace_id}/dataflows/{dataflow_id}/refreshes`
@@ -403,6 +427,8 @@ This ensures transient issues (network glitches, temporary service unavailabilit
 
 ### 5. Date Range Logic
 
+**Inclusive end-of-day contract:** `RangeEnd` is always the inclusive end of the bucket — `23:59:59` of the last day. Downstream Power Query filters should use `<= RangeEnd` (not `< RangeEnd`). This contract assumes source data does not contain meaningful sub-second values.
+
 - **End Date**: Always defaults to yesterday at 23:59:59 (never includes today's partial data)
 - **Bucket End Times**: All buckets end at 23:59:59 (the final bucket is capped at yesterday's 23:59:59)
 - **Next Bucket Start**: Previous bucket end + 1 second (ensures no gaps or overlaps)
@@ -420,7 +446,7 @@ The notebook proactively manages database connections to prevent timeout issues:
 
 Before deleting data from the destination table, the notebook backs up the affected rows into a separate schema:
 
-- **Backup table location**: `[Database].[_backup].[_backup_<dataflow_id_no_hyphens>]` (schema configurable via `backup_schema`; hyphens are stripped from the dataflow ID)
+- **Backup table location**: `[Database].[temporary_backup].[_backup_<dataflow_id_no_hyphens>]` (schema configurable via `backup_schema`; hyphens are stripped from the dataflow ID)
 - **Backup schema**: Auto-created on first run if it doesn't exist
 - **On success**: Backup table is dropped
 - **On failure**: Data is restored from backup, then backup is dropped
@@ -513,7 +539,7 @@ in
     FilteredData
 ```
 
-The notebook uses the Execute endpoint to pass these values at refresh time. If parameter discovery or the Execute call fails, it falls back to the standard Refresh endpoint automatically.
+The notebook uses the Execute endpoint to pass these values at refresh time. If parameter discovery or the initial Execute call fails (before any data modification), the notebook falls back to the standard Refresh endpoint automatically. Once destructive work has begun (backup created, data deleted), the operation fails closed — recovery is handled by the restore and retry path, not by falling back to Refresh.
 
 > **Note:** The tracking table is still updated with `range_start`/`range_end` regardless of whether parameters are passed directly. This maintains backward compatibility, status tracking, and retry logic.
 
@@ -546,7 +572,7 @@ in
 >
 > The Fabric REST endpoints used for CI/CD dataflow triggering and polling (`/v1/workspaces/.../items/.../jobs/instances`) are currently in **Public Preview** and are explicitly **not recommended for production use** by Microsoft. They may change or be removed without notice. Additionally, these APIs **do not support Service Principals or Managed Identities** — they require a user token with at least Member workspace permissions, making them incompatible with standard enterprise service connection accounts (Azure DevOps, GitHub Actions, etc.).
 >
-> Mitigation: The notebook falls back automatically from the Execute endpoint to the standard Refresh endpoint when parameter passing fails. Monitor [Microsoft's changelog](https://learn.microsoft.com/en-us/fabric/data-factory/dataflow-gen2-refresh) for GA availability. Until then, consider this path Tier-2/Tier-3 suitable and not Tier-1 mission-critical.
+> Mitigation: The notebook falls back automatically from the Execute endpoint to the standard Refresh endpoint when parameter passing fails — this fallback applies only at the parameter-passing stage, before any destructive work begins. Monitor [Microsoft's changelog](https://learn.microsoft.com/en-us/fabric/data-factory/dataflow-gen2-refresh) for GA availability. Until then, consider this path Tier-2/Tier-3 suitable and not Tier-1 mission-critical.
 
 > **Regular Dataflow Polling — Probabilistic Correlation**
 >
@@ -716,13 +742,13 @@ WHERE dataflow_id = 'your-dataflow-id'
 The notebook automatically detects and recovers from leftover backup tables on the next run. If you need to manually intervene:
 ```sql
 -- Check for backup tables
-SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('_backup')
+SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('temporary_backup')
 
 -- Manually restore from a backup if needed (note: hyphens are stripped from dataflow ID)
-INSERT INTO [dbo].[YourTable] SELECT * FROM [_backup].[_backup_<dataflow_id_no_hyphens>]
+INSERT INTO [dbo].[YourTable] SELECT * FROM [temporary_backup].[_backup_<dataflow_id_no_hyphens>]
 
 -- Drop the backup table
-DROP TABLE IF EXISTS [_backup].[_backup_<dataflow_id_no_hyphens>]
+DROP TABLE IF EXISTS [temporary_backup].[_backup_<dataflow_id_no_hyphens>]
 ```
 
 ### Monitoring and debugging
@@ -775,12 +801,13 @@ If you continue experiencing issues:
 
 ## Version History
 
+- **v5.11**: Addressed five critique findings: (High) `bootstrap_tracking_row()` deployment helper eliminates first-run INSERT race; runtime WARNING added for unbootstrapped first-run paths. (Medium) `Deduped` added as a terminal non-success polling status with an explanatory warning. (Medium) `_normalize_adhoc_dates()` now validates after capping — raises `ValueError` if the effective range is empty, preventing silent false-success `Completed` status. (Low) All four `wait_for_completion=False` backup-drop sites emit a data-safety warning documenting the unrecoverability risk. (Low) README updated: endpoint fallback note clarified, v5.2 history corrected, `bootstrap_tracking_row()` deployment step added.
 - **v5.4**: Production hardening release addressing all findings from dual-engineer architecture review (critique.md + critique2.md):
   - **High fix**: `force_run` is now a notebook parameter wired through to the entrypoint — operators can override stale concurrency guards from the pipeline without manual warehouse edits
   - **High fix**: SQL identifier validation (`_validate_sql_identifier`) guards `destination_table` and `incremental_update_column` against characters that would break DDL/DML at runtime; `_bq()` helper enforces consistent bracket-quoting
   - **High fix**: `job_instance_id` is now persisted to the tracking table immediately after every refresh trigger (in all four execution paths), enabling correlation between warehouse state and Fabric Monitoring Hub
   - **High fix**: Per-column VARCHAR widening — each of the five varchar columns is migrated independently so partial schema drift cannot remain silently unaddressed
-  - **Medium-High fix**: Append-only `[Incremental Update_History]` table added — one row per bucket attempt with `trigger_mode`, `bucket_index`, `attempt_number`, `start_time`, `end_time`, and all correlation IDs; history writes are non-fatal
+  - **Medium-High fix**: `[Incremental Update History]` table added — one row per bucket attempt with `trigger_mode`, `bucket_index`, `attempt_number`, `start_time`, `end_time`, and all correlation IDs; history writes are non-fatal
   - **Medium-High fix**: `last_backup_table` column added to `[Incremental Update]`; set when backup is created and consumed by recovery logic to restore the exact backup rather than picking by prefix search — ambiguous multi-orphan recovery is now refused rather than guessed
   - **Medium fix**: `_restore_from_backup` derives its column list from the backup table schema rather than the current destination table, remaining correct across deployment-time schema changes
   - **Medium fix**: Exponential backoff now includes ±5–10 s random jitter on all four retry sites to reduce thundering-herd pressure under capacity throttle
@@ -802,7 +829,7 @@ If you continue experiencing issues:
   - **Medium fix**: All timestamps use `datetime.utcnow()` (was `datetime.now()`, implicitly UTC in Fabric but now explicit)
   - **Medium fix**: Tracking table schema — varchar columns widened to 255, `run_id` and `job_instance_id` columns added, `dbo` schema hardcode replaced with dynamic detection
   - **Medium fix**: README updated to reflect name-based parameter resolution, ad-hoc mode compatibility table, and new `force_run` parameter
-- **v5.2**: Added automatic discovery and passing of `RangeStart`/`RangeEnd` as public parameters to CI/CD dataflows via the Execute endpoint, with graceful fallback to the Refresh endpoint
+- **v5.2**: Added automatic discovery and passing of `RangeStart`/`RangeEnd` as public parameters to CI/CD dataflows via the Execute endpoint. The runtime intentionally fails closed after destructive work begins — it does not fall back to the Refresh endpoint mid-operation (the v5.2 graceful-fallback wording was superseded by the fail-closed hardening introduced in later versions).
 - **v5.1**: Fixed ad-hoc mode creating duplicate tracking rows — subsequent ad-hoc runs now reuse the existing row instead of inserting a new one. Updated documentation: corrected API endpoints, retry mechanism description, architecture diagram, Power Query example, backup table naming, and other discrepancies
 - **v5.0**: Added data safety with backup/restore before deletes, ad-hoc extract mode, configurable backup schema, and skip-backup option
 - **v3.0**: Added bucket retry mechanism with exponential backoff and pipeline failure integration
