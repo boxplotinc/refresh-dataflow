@@ -250,7 +250,7 @@ Ensure your dataflow Power Query includes logic to read `range_start` and `range
 
 Before running the pipeline for the first time, call `bootstrap_tracking_row()` once during initial deployment to pre-seed the singleton tracking row with `status='New'`.
 
-**Why this matters**: Fabric Warehouse constraints are `NOT ENFORCED`. If two pipeline runs start simultaneously on a fresh deployment (no prior tracking row), both will attempt to `INSERT` a new row and succeed — creating duplicate rows that violate the singleton invariant. Pre-seeding with `bootstrap_tracking_row()` ensures the runtime always finds an existing row and uses the atomic `UPDATE` acquire path, which is race-safe (only one writer wins the compare-and-swap).
+**Why this matters**: Fabric Warehouse constraints are `NOT ENFORCED`. If two pipeline runs start simultaneously on a fresh deployment (no prior tracking row), both will attempt to `INSERT` a new row and succeed — creating duplicate rows that violate the singleton invariant. Pre-seeding with `bootstrap_tracking_row()` eliminates the first-run INSERT race when called before execution: the runtime always finds an existing row and uses the atomic `UPDATE` acquire path, which is race-safe (only one writer wins the compare-and-swap).
 
 **How to call it** (run once from a notebook cell or setup script):
 
@@ -268,7 +268,7 @@ refresher.bootstrap_tracking_row(
 )
 ```
 
-This method is idempotent — calling it multiple times is safe (it is a no-op if a row already exists).
+This method is idempotent — serially safe to call multiple times (it is a no-op if a row already exists). Note: concurrent bootstrap calls on an empty table can still both insert; serialize deployment manually to avoid this edge case.
 
 ## Quick Start Example
 
@@ -364,7 +364,7 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
   - Detection: `/v1/workspaces/{workspace_id}/items/{dataflow_id}`
   - Parameter Discovery: `/v1/workspaces/{workspace_id}/dataflows/{dataflow_id}/parameters`
   - Trigger (with parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Execute`
-  - Trigger (without parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Refresh` *(note: after destructive work begins, the runtime fails closed — it does not silently fall back to the Refresh endpoint if Execute fails mid-operation)*
+  - Trigger (without parameters): `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances?jobType=Refresh` *(note: both Execute and Refresh paths fail closed after destructive work begins — no silent fallback occurs once `refresh_dataflow()` is entered)*
   - Status: `/v1/workspaces/{workspace_id}/items/{dataflow_id}/jobs/instances`
 - **Regular Dataflows**:
   - Trigger: `/v1.0/myorg/groups/{workspace_id}/dataflows/{dataflow_id}/refreshes`
@@ -539,7 +539,7 @@ in
     FilteredData
 ```
 
-The notebook uses the Execute endpoint to pass these values at refresh time. If parameter discovery or the initial Execute call fails (before any data modification), the notebook falls back to the standard Refresh endpoint automatically. Once destructive work has begun (backup created, data deleted), the operation fails closed — recovery is handled by the restore and retry path, not by falling back to Refresh.
+The notebook uses the Execute endpoint to pass these values at refresh time. If parameter discovery or the initial Execute call fails **before any data modification**, the notebook falls back to the standard Refresh endpoint automatically. Once destructive work has begun (backup created, data deleted), all CI/CD paths fail closed — no automatic fallback occurs; recovery is handled by the restore and retry path.
 
 > **Note:** The tracking table is still updated with `range_start`/`range_end` regardless of whether parameters are passed directly. This maintains backward compatibility, status tracking, and retry logic.
 
@@ -572,7 +572,7 @@ in
 >
 > The Fabric REST endpoints used for CI/CD dataflow triggering and polling (`/v1/workspaces/.../items/.../jobs/instances`) are currently in **Public Preview** and are explicitly **not recommended for production use** by Microsoft. They may change or be removed without notice. Additionally, these APIs **do not support Service Principals or Managed Identities** — they require a user token with at least Member workspace permissions, making them incompatible with standard enterprise service connection accounts (Azure DevOps, GitHub Actions, etc.).
 >
-> Mitigation: The notebook falls back automatically from the Execute endpoint to the standard Refresh endpoint when parameter passing fails — this fallback applies only at the parameter-passing stage, before any destructive work begins. Monitor [Microsoft's changelog](https://learn.microsoft.com/en-us/fabric/data-factory/dataflow-gen2-refresh) for GA availability. Until then, consider this path Tier-2/Tier-3 suitable and not Tier-1 mission-critical.
+> Mitigation: The notebook falls back automatically from the Execute endpoint to the standard Refresh endpoint when parameter passing fails — this fallback applies only at the parameter-passing stage, before any destructive work begins. Once `refresh_dataflow()` is entered, all CI/CD paths fail closed with no automatic fallback; `wait_for_completion=False` additionally drops the backup without confirming success, making failures in that mode unrecoverable — use `wait_for_completion=True` (the default) for all production destructive workflows. Monitor [Microsoft's changelog](https://learn.microsoft.com/en-us/fabric/data-factory/dataflow-gen2-refresh) for GA availability. Until then, consider this path Tier-2/Tier-3 suitable and not Tier-1 mission-critical.
 
 > **Regular Dataflow Polling — Probabilistic Correlation**
 >
