@@ -190,6 +190,7 @@ Configure the following parameters when setting up the notebook activity in your
 | `force_run` | Boolean | No | Override the concurrency guard if a previous run appears active. Use with caution — only set if you are certain the active-looking run is stale (default: False) |
 | `validate_only` | Boolean | No | Resolve IDs and print the execution plan (bucket count, date ranges, parameters) without modifying any data. Useful for verifying configuration before a live run (default: False) |
 | `adhoc_fail_if_unsupported` | Boolean | No | When ad-hoc mode is requested on a dataflow that cannot consume the date range parameters, raise an error instead of silently proceeding with a best-effort reload (default: True) |
+| `cicd_execute_route_mode` | String | No | CI/CD Execute route compatibility mode. `'auto'` (default) tries the documented endpoint first and falls back to the legacy Background Jobs route on `400 InvalidJobType` when no job was created. `'documented'` always uses the documented Dataflow Execute path. `'legacy_query'` always uses the legacy `?jobType=Execute` path. See [CI/CD Execute — InvalidJobType](#cicd-execute--invalidjobtype-http-400) for details. |
 
 ## Notebook Constants
 
@@ -793,6 +794,35 @@ FROM RangedData
 WHERE DATEADD(SECOND, 1, range_end) < next_start
 ```
 
+### CI/CD Execute — `InvalidJobType` (HTTP 400)
+
+**Symptoms:**
+- CI/CD run succeeds through all pre-flight checks (`RangeStart`/`RangeEnd` confirmed) but fails at the Execute trigger
+- Fabric error code `InvalidJobType`, HTTP 400
+- Log message: `"Failed to trigger CI/CD dataflow … HTTP 400, errorCode='InvalidJobType'"`
+
+**Root cause:**
+The documented Dataflow Execute endpoint (`/v1/workspaces/{wid}/dataflows/{dfid}/jobs/execute/instances`) is a preview API. Some tenant clusters have not yet adopted this route shape and return `400 InvalidJobType` even though Microsoft Learn documents the path. The older Background Jobs API route (`?jobType=Execute`) is still accepted by these clusters.
+
+**Default behaviour (`cicd_execute_route_mode = 'auto'`):**
+The notebook tries the documented route first. If it receives `400 InvalidJobType` with no `Location` header (meaning no job was created), it logs a warning and retries once on the legacy Background Jobs route using the identical parameter payload. No data risk: the retry only fires when the first request was rejected before any job instance was created.
+
+**Permanently switch to the legacy route:**
+If the documented route consistently fails in your tenant, set:
+```
+cicd_execute_route_mode = 'legacy_query'
+```
+
+**Permanently lock to the documented route:**
+Once a smoke test confirms the documented route works consistently in your tenant, set:
+```
+cicd_execute_route_mode = 'documented'
+```
+This avoids the auto-retry overhead on every run.
+
+**Same-run restore on trigger rejection:**
+If the trigger is rejected after the production range has already been deleted, the notebook restores from the pinned backup immediately in the same run — the production range is not left hollow until the next notebook run. The log will confirm: `"Same-run restore completed — production data is intact."` If same-run restore fails, the backup is preserved and the log will say: `"Backup preserved for manual recovery."` Next-run recovery via `_recover_from_backup_if_needed()` remains active as a safety net for crash/OOM scenarios.
+
 ### Getting help
 
 If you continue experiencing issues:
@@ -803,6 +833,7 @@ If you continue experiencing issues:
 
 ## Version History
 
+- **v5.15**: Addressed seven critique findings from March 2026 review: (High) `cicd_execute_route_mode` parameter added (`'auto'`/`'documented'`/`'legacy_query'`); in `'auto'` mode the documented Execute endpoint is tried first and a `400 InvalidJobType` response with no job created triggers a single retry on the legacy Background Jobs route (`?jobType=Execute`) using the identical parameter payload — safe because the first request was rejected before any job instance was created. (High) All four trigger call sites now wrap the delete→trigger sequence in a per-attempt try/except; a trigger rejection after delete performs an immediate same-run restore from the pinned backup — the log explicitly states whether restore succeeded or the backup was preserved for manual recovery; next-run recovery via `_recover_from_backup_if_needed()` remains active for crash/OOM scenarios. (Medium) Diagnostic helpers added to capture `requestId`, `x-ms-public-api-error-code`, `home-cluster-uri` headers and the route label on every trigger attempt and error path. (Low) `sys.exit(0/1)` replaced with normal completion / `raise` so Fabric surfaces the real error message rather than a misleading "Kernel died" symptom. README updated with `cicd_execute_route_mode` parameter documentation and CI/CD Execute `InvalidJobType` troubleshooting guide.
 - **v5.13**: Addressed five critique findings from March 2026 review: (High) CI/CD parameter discovery now distinguishes transient failure from confirmed non-support — returns a 3-state result; only confirmed results are cached; a pre-flight check in `execute_incremental_refresh()` fails closed before any backup or delete when `RangeStart`/`RangeEnd` are absent or discovery is inconclusive; unparameterized CI/CD Execute path removed — all CI/CD dataflows must expose public `RangeStart` and `RangeEnd` parameters. (Medium) CI/CD polling now stays on the exact `job_instance_id` contract throughout a run — the direct-instance poll returns `None` on transient errors instead of falling through to the list endpoint; the list endpoint no longer flips `is_cicd_dataflow` to `False` on failure; the regular transactions API is never reached as a CI/CD fallback. (Low-Medium) `_detect_dataflow_type()` now returns `None` (inconclusive) instead of `False` for 401/403/429/5xx probe responses and total detection failure; `execute_incremental_refresh()`, `refresh_dataflow()`, and `get_latest_refresh_status()` all raise with a clear operator message when detection is inconclusive rather than silently defaulting to the regular dataflow path. (Low-Medium) README corrected: trigger endpoint updated to documented Dataflow Execute path, fallback language removed, SP/MI statement qualified per-endpoint, `wait_for_completion`/`timeout_minutes` documented as internal defaults rather than operator-facing parameters, version history label corrected. (Low-Medium) `executeOption` extracted from hardcoded literal to `DataflowRefresher._CICD_EXECUTE_OPTION` class constant with inline documentation of the `SkipApplyChanges` vs `ApplyChangesIfNeeded` trade-off.
 - **v5.12**: Addressed four critique findings: (Medium) Stale `is_cicd_dataflow` stored value demoted from routing authority to diagnostic warning — caller's explicit value and live auto-detection now always take precedence in the continuation path; warning fires if stored value differs from resolved value. (Medium) CI/CD trigger endpoints migrated from legacy item-level paths (`/items/{id}/jobs/instances?jobType=`) to documented Dataflow-specific path (`/dataflows/{id}/jobs/execute/instances`); undocumented `Refresh` job type replaced with documented `Execute`. (Low-Medium) `executeOption: SkipApplyChanges` added explicitly inside `executionData` on both CI/CD Execute payloads; `DataflowName` removed from no-parameter payload (not in Execute schema). (Low) Bootstrap wording corrected from "eliminates" to "avoids … when deployment is serialized" in log message and README.
 - **v5.11**: Addressed five critique findings: (High) `bootstrap_tracking_row()` deployment helper avoids the first-run INSERT race when bootstrap is serialized before first execution; runtime WARNING added for unbootstrapped first-run paths. (Medium) `Deduped` added as a terminal non-success polling status with an explanatory warning. (Medium) `_normalize_adhoc_dates()` now validates after capping — raises `ValueError` if the effective range is empty, preventing silent false-success `Completed` status. (Low) All four `wait_for_completion=False` backup-drop sites emit a data-safety warning documenting the unrecoverability risk. (Low) README updated: endpoint fallback note clarified, v5.2 history corrected, `bootstrap_tracking_row()` deployment step added.
