@@ -41,7 +41,7 @@ Microsoft Fabric's standard incremental refresh capabilities have limitations th
 - ✅ **Intelligent Retry Mechanism**: Automatically retries failed buckets with exponential backoff before marking operations as failed
 - ✅ **Automated Date Range Tracking**: Maintains metadata in warehouse tracking tables to manage incremental loads without manual intervention
 - ✅ **CI/CD & Regular Dataflow Support**: Auto-detects dataflow type and uses appropriate Microsoft Fabric REST API endpoints
-- ✅ **Pipeline Integration**: Proper failure codes ensure seamless integration with Fabric pipeline error handling and alerting
+- ✅ **Pipeline Integration**: Exceptions are re-raised on failure, surfacing the real error message in Fabric pipeline error handling and alerting
 
 This solution is ideal for data engineers working with Microsoft Fabric who need robust, production-ready incremental refresh capabilities beyond what's available out of the box.
 
@@ -163,7 +163,7 @@ The notebook orchestrates a coordinated refresh process across multiple Fabric c
 - **Direct Parameter Passing**: Automatically discovers and passes `RangeStart`/`RangeEnd` as public parameters to CI/CD dataflows that support them, eliminating the need for the dataflow to query the tracking table
 - **Connection Management**: Handles database connections with automatic retry and reconnection logic to prevent timeout issues
 - **Comprehensive Status Tracking**: Maintains detailed metadata about refresh operations in a warehouse tracking table
-- **Pipeline Failure Integration**: Exits with proper failure codes to integrate with Fabric pipeline error handling
+- **Pipeline Failure Integration**: Re-raises exceptions on failure to integrate with Fabric pipeline error handling
 - **Data Safety (Backup & Restore)**: Automatically backs up data before deleting, restores on failure, and recovers from interrupted runs
 - **Ad-hoc Extract Mode**: Load data for an arbitrary date range without disrupting incremental state
 
@@ -385,7 +385,7 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
    - Triggers dataflow refresh
    - Waits for completion and monitors status
    - **If bucket fails**: Restores data from backup, then retries up to `bucket_retry_attempts` times with exponential backoff (30s, 60s, 120s, etc.)
-   - **If all retries fail**: Data has been restored from the last backup. Logs error, updates tracking table, and **exits with failure code (1)** to fail the pipeline
+   - **If all retries fail**: Data has been restored from the last backup. Logs error, updates tracking table, and **raises RuntimeError** to fail the pipeline
    - **If bucket succeeds**: Drops the backup table, then moves to next bucket
 
 #### **Scenario B: Previous Refresh Failed**
@@ -394,7 +394,7 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
 2. Retrieves the failed bucket's date range
 3. Backs up data in the affected range (unless `skip_backup` is True)
 4. Retries the failed bucket using the same retry logic as above, restoring from backup on each failure
-5. **If all retries fail**: Data has been restored from backup. Exits with failure code to fail the pipeline
+5. **If all retries fail**: Data has been restored from backup. Raises exception to fail the pipeline
 6. **If retry succeeds**: Drops backup table, completes the run. The next pipeline run continues with normal incremental processing (Scenario C)
 
 #### **Scenario C: Incremental Update (Previous Refresh Successful)**
@@ -405,7 +405,7 @@ The notebook automatically detects whether the dataflow is a CI/CD or regular da
    - End date is always yesterday at 23:59:59
 2. Splits date range into buckets if needed
 3. Processes each bucket with the same backup/restore, retry, and failure logic as initial load
-4. **If any bucket fails after all retries**: Data has been restored from backup. Exits with failure code to fail the pipeline
+4. **If any bucket fails after all retries**: Data has been restored from backup. Raises exception to fail the pipeline
 
 ### 4. Retry Mechanism with Exponential Backoff
 
@@ -420,8 +420,7 @@ Each subsequent retry doubles the wait time (30s × 2^(attempt-1)) plus a small 
 4. **If all attempts fail**:
    - Updates tracking table with failed status
    - Logs detailed error message
-   - Raises `RuntimeError` with failure details
-   - **Exits with `sys.exit(1)`** to mark the notebook as failed in the pipeline
+   - **Raises `RuntimeError`** — the exception propagates to Fabric, marking the notebook as failed in the pipeline
    - **No further buckets are processed**
 
 This ensures transient issues (network glitches, temporary service unavailability) are handled gracefully, while persistent failures properly fail the pipeline.
@@ -519,7 +518,7 @@ Please check the logs above for detailed error information.
 ================================================================================
 ```
 
-In both cases, the notebook exits with code 1, causing the Fabric pipeline to mark the notebook activity as **Failed**.
+In both cases, the notebook re-raises the exception, causing the Fabric pipeline to mark the notebook activity as **Failed** and surface the real error message.
 
 ## Integration with Dataflow Power Query
 
